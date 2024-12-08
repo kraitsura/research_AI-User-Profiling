@@ -13,6 +13,15 @@ from typing import List, Dict, Any, Optional
 import os
 import nest_asyncio
 import asyncio
+import plotly.graph_objects as go
+import plotly.express as px
+import plotly.figure_factory as ff
+from plotly.subplots import make_subplots
+import networkx as nx
+from scipy import stats
+import dotenv
+
+dotenv.load_dotenv()
 
 nest_asyncio.apply()
 
@@ -291,8 +300,183 @@ class PredictionParser:
         
         return parsed_data
 
+class ExperimentVisualizer:
+    """
+    Enhanced visualization class for experiment results analysis
+    """
+    def __init__(self, output_dir: str = "visualizations"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+    def create_accuracy_heatmap(self, actual_df: pd.DataFrame, predicted_df: pd.DataFrame,
+                              demographic_pairs: List[tuple]) -> None:
+        """
+        Creates heatmaps showing prediction accuracy across different demographic combinations
+        """
+        for dem1, dem2 in demographic_pairs:
+            accuracy_matrix = pd.DataFrame(index=actual_df[dem1].unique(),
+                                         columns=actual_df[dem2].unique())
+            
+            for val1 in actual_df[dem1].unique():
+                for val2 in actual_df[dem2].unique():
+                    mask = (actual_df[dem1] == val1) & (actual_df[dem2] == val2)
+                    if mask.any():
+                        actual_subset = actual_df[mask].reset_index(drop=True)
+                        predicted_subset = predicted_df[mask].reset_index(drop=True)
+                        
+                        accuracy = (actual_subset[[dem1, dem2]] == 
+                                  predicted_subset[[dem1, dem2]]).mean().mean()
+                        accuracy_matrix.loc[val1, val2] = accuracy
+            
+            accuracy_matrix = accuracy_matrix.fillna(0).infer_objects(copy=False)
+            
+            fig = go.Figure(data=go.Heatmap(
+                z=accuracy_matrix.values,
+                x=accuracy_matrix.columns,
+                y=accuracy_matrix.index,
+                colorscale="Viridis",
+                text=np.round(accuracy_matrix.values, 2),
+                texttemplate="%{text}",
+                textfont={"size": 10},
+            ))
+            
+            fig.update_layout(
+                title=f"Prediction Accuracy Heatmap: {dem1} vs {dem2}",
+                xaxis_title=dem2,
+                yaxis_title=dem1,
+            )
+            fig.write_html(f"{self.output_dir}/heatmap_{dem1}_{dem2}.html")
+
+    def create_radar_chart(self, analysis_results: Dict[str, Any]) -> None:
+        """
+        Creates a radar/spider chart comparing accuracy across all characteristics
+        """
+        categories = list(analysis_results.keys())
+        accuracies = [v['accuracy'] for v in analysis_results.values()]
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatterpolar(
+            r=accuracies + [accuracies[0]],  # Close the polygon
+            theta=categories + [categories[0]],
+            fill='toself',
+            name='Prediction Accuracy'
+        ))
+        
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 1]
+                )),
+            showlegend=False,
+            title="Prediction Accuracy Across Characteristics"
+        )
+        fig.write_html(f"{self.output_dir}/radar_chart.html")
+
+    def create_numerical_boxplots(self, actual_df: pd.DataFrame, predicted_df: pd.DataFrame,
+                                numerical_cols: List[str]) -> None:
+        """
+        Creates box plots showing prediction variance for numerical variables
+        """
+        fig = make_subplots(rows=len(numerical_cols), cols=1,
+                           subplot_titles=[f"{col} Distribution" for col in numerical_cols])
+        
+        for idx, col in enumerate(numerical_cols, 1):
+            fig.add_trace(
+                go.Box(y=actual_df[col], name="Actual", boxpoints="all",
+                      jitter=0.3, pointpos=-1.8),
+                row=idx, col=1
+            )
+            fig.add_trace(
+                go.Box(y=predicted_df[col], name="Predicted", boxpoints="all",
+                      jitter=0.3, pointpos=1.8),
+                row=idx, col=1
+            )
+        
+        fig.update_layout(height=300*len(numerical_cols),
+                         title_text="Actual vs Predicted Distributions")
+        fig.write_html(f"{self.output_dir}/numerical_boxplots.html")
+
+    def create_sankey_diagram(self, actual_df: pd.DataFrame, predicted_df: pd.DataFrame,
+                            category: str) -> None:
+        """
+        Creates Sankey diagrams showing prediction flows from actual to predicted categories
+        """
+        actual_values = actual_df[category].values
+        predicted_values = predicted_df[category].values
+        
+        # Create node labels
+        unique_values = list(set(actual_values) | set(predicted_values))
+        node_labels = unique_values + [f"Predicted {val}" for val in unique_values]
+        
+        # Create source-target pairs
+        source = []
+        target = []
+        value = []
+        
+        for i, actual_val in enumerate(unique_values):
+            for j, pred_val in enumerate(unique_values):
+                count = sum((actual_values == actual_val) & (predicted_values == pred_val))
+                if count > 0:
+                    source.append(unique_values.index(actual_val))
+                    target.append(len(unique_values) + unique_values.index(pred_val))
+                    value.append(count)
+        
+        fig = go.Figure(data=[go.Sankey(
+            node=dict(
+                pad=15,
+                thickness=20,
+                line=dict(color="black", width=0.5),
+                label=node_labels,
+            ),
+            link=dict(
+                source=source,
+                target=target,
+                value=value
+            )
+        )])
+        
+        fig.update_layout(title_text=f"Prediction Flow for {category}")
+        fig.write_html(f"{self.output_dir}/sankey_{category}.html")
+
+    def create_violin_plots(self, actual_df: pd.DataFrame, predicted_df: pd.DataFrame,
+                          numerical_cols: List[str]) -> None:
+        """
+        Creates violin plots comparing distribution of predicted vs actual numerical values
+        """
+        for col in numerical_cols:
+            fig = go.Figure()
+            
+            fig.add_trace(go.Violin(
+                y=actual_df[col],
+                name="Actual",
+                side="negative",
+                line_color="blue"
+            ))
+            
+            fig.add_trace(go.Violin(
+                y=predicted_df[col],
+                name="Predicted",
+                side="positive",
+                line_color="red"
+            ))
+            
+            fig.update_layout(
+                title=f"{col} Distribution Comparison",
+                yaxis_zeroline=False,
+                violingap=0,
+                violinmode="overlay"
+            )
+            
+            fig.write_html(f"{self.output_dir}/violin_{col}.html")
+
 class ExperimentAnalyzer:
-    """Analyzes experiment results and generates visualizations"""
+    """Analyzes experiment results and generates comprehensive visualizations"""
+    
+    def __init__(self, output_dir: str = "analysis_output"):
+        self.output_dir = output_dir
+        self.visualizer = ExperimentVisualizer(os.path.join(output_dir, "visualizations"))
+        os.makedirs(output_dir, exist_ok=True)
     
     def evaluate_predictions(self, predicted_df: pd.DataFrame, actual_df: pd.DataFrame) -> Dict[str, Any]:
         """
@@ -300,38 +484,61 @@ class ExperimentAnalyzer:
         """
         results = {}
         
-        # Calculate accuracy for each column
         for column in actual_df.columns:
             if column in predicted_df.columns:
+                # Get all possible labels for this column
+                all_labels = list(set(actual_df[column].unique()) | set(predicted_df[column].unique()))
+                
                 results[column] = {
-                    'accuracy': accuracy_score(actual_df[column], predicted_df[column])
+                    'accuracy': accuracy_score(actual_df[column], predicted_df[column]),
+                    'confusion_matrix': confusion_matrix(
+                        actual_df[column], 
+                        predicted_df[column],
+                        labels=all_labels  # Add labels parameter
+                    ).tolist(),
+                    'classification_report': classification_report(
+                        actual_df[column], 
+                        predicted_df[column],
+                        labels=all_labels,  # Add labels parameter
+                        zero_division=0  # Add zero_division parameter
+                    )
                 }
         
         return results
     
-    def generate_visualizations(self, analysis_results: Dict[str, Any]) -> None:
+    def generate_visualizations(self, actual_df: pd.DataFrame, predicted_df: pd.DataFrame,
+                              analysis_results: Dict[str, Any]) -> None:
         """
-        Generates and saves visualization of prediction accuracy
+        Generates comprehensive set of visualizations
         """
-        accuracies = [v['accuracy'] for v in analysis_results.values()]
-        categories = list(analysis_results.keys())
+        # Define demographic pairs for heatmaps
+        demographic_pairs = [
+            ('gender', 'education_level'),
+            ('age', 'income_level'),
+            ('location_type', 'political_leaning'),
+            ('race', 'occupation')
+        ]
         
-        plt.figure(figsize=(12, 6))
-        plt.bar(categories, accuracies)
-        plt.xticks(rotation=45, ha='right')
-        plt.ylabel('Accuracy')
-        plt.title('Prediction Accuracy by Characteristic')
-        plt.tight_layout()
-        plt.savefig('accuracy_by_characteristic.png')
-        plt.close()
+        # Define numerical columns
+        numerical_cols = ['age', 'income_level']
+        
+        # Generate all visualizations
+        self.visualizer.create_accuracy_heatmap(actual_df, predicted_df, demographic_pairs)
+        self.visualizer.create_radar_chart(analysis_results)
+        self.visualizer.create_numerical_boxplots(actual_df, predicted_df, numerical_cols)
+        
+        # Generate Sankey diagrams for categorical variables
+        categorical_cols = [col for col in actual_df.columns if col not in numerical_cols]
+        for col in categorical_cols:
+            self.visualizer.create_sankey_diagram(actual_df, predicted_df, col)
+        
+        # Generate violin plots for numerical variables
+        self.visualizer.create_violin_plots(actual_df, predicted_df, numerical_cols)
 
+# Update the run_experiment function to use the new visualization capabilities
 async def run_experiment(num_personas: int = 100, messages_per_conversation: int = 5):
     """
-    Runs the complete experiment
-    
-    Parameters:
-    num_personas: Number of personas to generate and test
-    messages_per_conversation: Number of message exchanges before final questions
+    Runs the complete experiment with enhanced visualization
     """
     generator = PersonaGenerator()
     openai_manager = OpenAIManager()
@@ -341,17 +548,12 @@ async def run_experiment(num_personas: int = 100, messages_per_conversation: int
     
     for i in range(num_personas):
         try:
-            # Generate persona
             actual_persona = generator.generate_persona()
-            
-            # Conduct conversation
             conversation_data = await conversation_manager.conduct_conversation(
                 persona_id=i,
                 actual_persona=actual_persona,
                 num_messages=messages_per_conversation
             )
-            
-            # Parse prediction
             predicted_persona = PredictionParser.parse_prediction(conversation_data['prediction'])
             
             results.append({
@@ -366,28 +568,29 @@ async def run_experiment(num_personas: int = 100, messages_per_conversation: int
             print(f"Error in conversation {i}: {str(e)}")
             continue
     
-    # Analyze results
+    # Create DataFrames for analysis
+    actual_df = pd.DataFrame([r['actual_persona'] for r in results])
+    predicted_df = pd.DataFrame([r['predicted_persona'] for r in results])
+    
+    # Initialize analyzer and generate results
     analyzer = ExperimentAnalyzer()
-    analysis_results = analyzer.evaluate_predictions(
-        pd.DataFrame([r['predicted_persona'] for r in results]),
-        pd.DataFrame([r['actual_persona'] for r in results])
-    )
+    analysis_results = analyzer.evaluate_predictions(predicted_df, actual_df)
     
-    # Generate visualizations
-    analyzer.generate_visualizations(analysis_results)
+    # Generate all visualizations
+    analyzer.generate_visualizations(actual_df, predicted_df, analysis_results)
     
-    return results, analysis_results
+    return results, analysis_results, actual_df, predicted_df
 
 if __name__ == "__main__":
     async def main():
-        results, analysis = await run_experiment(
-            num_personas=50,
+        results, analysis_results, actual_df, predicted_df = await run_experiment(
+            num_personas=10,
             messages_per_conversation=6
         )
-        return results, analysis
+        return results, analysis_results, actual_df, predicted_df
 
     # Get the current event loop or create a new one
     loop = asyncio.get_event_loop()
-    results, analysis = loop.run_until_complete(main())
+    results, analysis_results, actual_df, predicted_df = loop.run_until_complete(main())
     
     print("Experiment completed. Check the output directory for results and visualizations.")
