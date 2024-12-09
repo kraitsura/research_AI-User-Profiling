@@ -13,6 +13,10 @@ from typing import List, Dict, Any, Optional
 import os
 import nest_asyncio
 import asyncio
+import dotenv
+from asyncio import Semaphore
+
+dotenv.load_dotenv()
 
 nest_asyncio.apply()
 
@@ -29,21 +33,27 @@ class ConversationPrompts:
     
     # Prompt for the analyzer AI to predict persona characteristics
     ANALYSIS_PROMPT = """Based on the conversation above, please analyze the person you were talking to 
-    and predict their characteristics in the following format (make your best guess for each category):
+    and predict their characteristics. You MUST choose from EXACTLY these options for each category:
 
-    Age: [single number between 18-80, no ranges]
-    Gender: [exactly one of: Male/Female/Non-binary]
-    Race: [exactly one of: White/Black/Asian/Hispanic/Native American/Pacific Islander/Mixed Race]
-    Education Level: [exactly one of: High School/Bachelor's/Master's/Doctorate/Some College/Associate's Degree]
-    Location Type: [exactly one of: Urban/Suburban/Rural]
-    State: [exactly one of: California/New York/Texas/Florida/Illinois]
-    Political Leaning: [exactly one of: Liberal/Conservative/Moderate/Libertarian/Green]
-    Occupation: [exactly one of: Professional/Service Industry/Management/Technical/Sales/Administrative/Education/Healthcare/Self-employed]
-    Family Structure: [exactly one of: Single/Married/Divorced/Widowed/Living with Partner/Single Parent/Nuclear Family]
-    Health Status: [exactly one of: Excellent/Good/Fair/Poor]
-    Income Level: [single number between 1-10, no ranges]
+    Age: [single number 18-80]
+    Gender: [Male/Female/Non-binary]
+    Race: [White/Black/Asian/Hispanic/Native American/Pacific Islander/Mixed Race]
+    Education Level: [High School/Bachelor's/Master's/Doctorate/Some College/Associate's Degree]
+    Location Type: [Urban/Suburban/Rural]
+    State: [California/New York/Texas/Florida/Illinois]
+    Political Leaning: [Liberal/Conservative/Moderate/Libertarian/Green]
+    Occupation: [Professional/Service Industry/Management/Technical/Sales/Administrative/Education/Healthcare/Self-employed]
+    Family Structure: [Single/Married/Divorced/Widowed/Living with Partner/Single Parent/Nuclear Family]
+    Health Status: [Excellent/Good/Fair/Poor]
+    Income Level: [single number 1-10]
 
-    Please ONLY respond with the above format, no additional text. Use exact values from the options provided."""
+    DO NOT use any values outside these options. If unsure, choose the closest match from the provided options.
+    Respond ONLY with category: value pairs, no explanation or additional text.
+    Your answer MUST be EXACTLY in the following format:
+    Age: [number]
+    Gender: [string]
+    ...
+    Income Level: [number]"""
 
     @staticmethod
     def get_conversation_starter() -> str:
@@ -167,10 +177,11 @@ class OpenAIManager:
 class ConversationManager:
     """Manages the flow of conversations between personas"""
     
-    def __init__(self, openai_manager: OpenAIManager, output_dir: str = "conversations"):
+    def __init__(self, openai_manager: OpenAIManager, output_dir: str = "conversations", max_concurrent: int = 5):
         self.openai_manager = openai_manager
         self.output_dir = output_dir
         self.conversation_metadata = {}
+        self.semaphore = Semaphore(max_concurrent)  # Control concurrent API calls
         os.makedirs(output_dir, exist_ok=True)
 
     async def conduct_conversation(
@@ -184,71 +195,72 @@ class ConversationManager:
         1. Persona AI: Given the persona characteristics
         2. Interviewer AI: Tries to naturally converse and later guess the persona
         """
-        # Initialize persona AI with system prompt
-        persona_messages = [{
-            "role": "system",
-            "content": PersonaGenerator().generate_persona_system_prompt(actual_persona)
-        }]
-        
-        # Initialize interviewer AI with system prompt
-        interviewer_messages = [{
-            "role": "system",
-            "content": """You are an AI conducting a natural conversation. Your goal is to:
-            1. Have a genuine, engaging conversation
-            2. Through natural dialogue, try to understand the person you're talking to
-            3. Pay attention to subtle cues about their demographics, lifestyle, and views
-            4. Keep responses conversational and appropriate in length (2-4 sentences)
+        async with self.semaphore:  # Limit concurrent conversations
+            # Initialize persona AI with system prompt
+            persona_messages = [{
+                "role": "system",
+                "content": PersonaGenerator().generate_persona_system_prompt(actual_persona)
+            }]
             
-            Do not explicitly ask about demographic information - let it come up naturally."""
-        }]
-        
-        # Start with a conversation starter
-        starter = ConversationPrompts.get_conversation_starter()
-        conversation_history = []  # To store the full conversation
-        conversation_history.append({"role": "interviewer", "content": starter})
-        
-        # Add starter to both message histories
-        persona_messages.append({"role": "user", "content": starter})
-        
-        # Conduct main conversation
-        for _ in range(num_messages):
-            # Get response from persona
-            persona_response = await self.openai_manager.get_completion(persona_messages)
-            conversation_history.append({"role": "persona", "content": persona_response})
-            interviewer_messages.append({"role": "user", "content": persona_response})
+            # Initialize interviewer AI with system prompt
+            interviewer_messages = [{
+                "role": "system",
+                "content": """You are an AI conducting a natural conversation. Your goal is to:
+                1. Have a genuine, engaging conversation
+                2. Through natural dialogue, try to understand the person you're talking to
+                3. Pay attention to subtle cues about their demographics, lifestyle, and views
+                4. Keep responses conversational and appropriate in length (2-4 sentences)
+                
+                Do not explicitly ask about demographic information - let it come up naturally."""
+            }]
             
-            # Generate next question from interviewer
-            interviewer_response = await self.openai_manager.get_completion(interviewer_messages)
-            conversation_history.append({"role": "interviewer", "content": interviewer_response})
-            persona_messages.append({"role": "user", "content": interviewer_response})
-        
-        # Ask final questions
-        for question in ConversationPrompts.FINAL_QUESTIONS:
-            conversation_history.append({"role": "interviewer", "content": question})
-            persona_messages.append({"role": "user", "content": question})
-            persona_response = await self.openai_manager.get_completion(persona_messages)
-            conversation_history.append({"role": "persona", "content": persona_response})
-        
-        # Get persona prediction from interviewer
-        analysis_prompt = ConversationPrompts.ANALYSIS_PROMPT
-        prediction = await self.openai_manager.get_completion([
-            {"role": "system", "content": "You are analyzing the conversation to predict characteristics of the person you spoke with."},
-            *[{"role": "user" if msg["role"] == "persona" else "assistant", "content": msg["content"]} 
-              for msg in conversation_history if msg["role"] in ["persona", "interviewer"]],
-            {"role": "user", "content": analysis_prompt}
-        ], temperature=0.3)
-        
-        # Save conversation
-        conversation_data = {
-            'persona_id': persona_id,
-            'actual_persona': actual_persona,
-            'conversation_history': conversation_history,
-            'prediction': prediction,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        self._save_conversation(conversation_data)
-        return conversation_data
+            # Start with a conversation starter
+            starter = ConversationPrompts.get_conversation_starter()
+            conversation_history = []  # To store the full conversation
+            conversation_history.append({"role": "interviewer", "content": starter})
+            
+            # Add starter to both message histories
+            persona_messages.append({"role": "user", "content": starter})
+            
+            # Conduct main conversation
+            for _ in range(num_messages):
+                # Get response from persona
+                persona_response = await self.openai_manager.get_completion(persona_messages)
+                conversation_history.append({"role": "persona", "content": persona_response})
+                interviewer_messages.append({"role": "user", "content": persona_response})
+                
+                # Generate next question from interviewer
+                interviewer_response = await self.openai_manager.get_completion(interviewer_messages)
+                conversation_history.append({"role": "interviewer", "content": interviewer_response})
+                persona_messages.append({"role": "user", "content": interviewer_response})
+            
+            # Ask final questions
+            for question in ConversationPrompts.FINAL_QUESTIONS:
+                conversation_history.append({"role": "interviewer", "content": question})
+                persona_messages.append({"role": "user", "content": question})
+                persona_response = await self.openai_manager.get_completion(persona_messages)
+                conversation_history.append({"role": "persona", "content": persona_response})
+            
+            # Get persona prediction from interviewer
+            analysis_prompt = ConversationPrompts.ANALYSIS_PROMPT
+            prediction = await self.openai_manager.get_completion([
+                {"role": "system", "content": "You are analyzing the conversation to predict characteristics of the person you spoke with."},
+                *[{"role": "user" if msg["role"] == "persona" else "assistant", "content": msg["content"]} 
+                  for msg in conversation_history if msg["role"] in ["persona", "interviewer"]],
+                {"role": "user", "content": analysis_prompt}
+            ], temperature=0.3)
+            
+            # Save conversation
+            conversation_data = {
+                'persona_id': persona_id,
+                'actual_persona': actual_persona,
+                'conversation_history': conversation_history,
+                'prediction': prediction,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            self._save_conversation(conversation_data)
+            return conversation_data
 
     def _save_conversation(self, conversation_data: Dict[str, Any]) -> None:
         """Saves conversation data to a JSON file"""
@@ -267,25 +279,61 @@ class PredictionParser:
         lines = prediction_text.strip().split('\n')
         parsed_data = {}
         
+        # Define valid values for each category
+        valid_categories = {
+            'gender': {'Male', 'Female', 'Non-binary'},
+            'state': {'California', 'New York', 'Texas', 'Florida', 'Illinois'},
+            'education_level': {"High School", "Bachelor's", "Master's", "Doctorate", "Some College", "Associate's Degree"},
+            'location_type': {'Urban', 'Suburban', 'Rural'},
+            'race': {'White', 'Black', 'Asian', 'Hispanic', 'Native American', 'Pacific Islander', 'Mixed Race'},
+            'political_leaning': {'Liberal', 'Conservative', 'Moderate', 'Libertarian', 'Green'},
+            'occupation': {'Professional', 'Service Industry', 'Management', 'Technical', 'Sales', 
+                         'Administrative', 'Education', 'Healthcare', 'Self-employed'},
+            'family_structure': {'Single', 'Married', 'Divorced', 'Widowed', 'Living with Partner', 
+                               'Single Parent', 'Nuclear Family'},
+            'health_status': {'Excellent', 'Good', 'Fair', 'Poor'}
+        }
+        
         for line in lines:
             if ':' in line:
                 key, value = line.split(':', 1)
                 key = key.strip().lower().replace(' ', '_')
-                value = value.strip()
+                value = value.strip().strip('[]').strip()  # Remove brackets and extra whitespace
                 
-                # Handle hobbies list
-                if key == 'hobbies':
-                    value = [h.strip() for h in value.strip('[]').split(',')]
-                # Handle age ranges and numeric values
-                elif key == 'age' or key == 'income_level':
-                    # Remove brackets if present
-                    value = value.strip('[]')
-                    # If it's a range, take the average
-                    if '-' in value:
-                        low, high = map(int, value.split('-'))
-                        value = (low + high) // 2
-                    else:
+                # Normalize values
+                if key == 'age':
+                    try:
+                        # Handle ranges by taking average
+                        if '-' in value:
+                            low, high = map(int, value.split('-'))
+                            value = (low + high) // 2
+                        else:
+                            value = int(value)
+                            # Round to nearest valid age (18-80)
+                            value = max(18, min(80, value))
+                    except ValueError:
+                        print(f"Warning: Could not parse age value: {value}")
+                        continue
+                
+                elif key == 'income_level':
+                    try:
                         value = int(value)
+                        # Ensure value is between 1-10
+                        value = max(1, min(10, value))
+                    except ValueError:
+                        print(f"Warning: Could not parse income level: {value}")
+                        continue
+                
+                # Validate categorical values
+                elif key in valid_categories:
+                    # Normalize the value
+                    normalized_value = value.strip("'").strip('"')
+                    # Check if value is valid for this category
+                    if normalized_value not in valid_categories[key]:
+                        print(f"Warning: Invalid {key} value: {normalized_value}")
+                        # Skip invalid values instead of including them
+                        continue
+                    value = normalized_value
                 
                 parsed_data[key] = value
         
@@ -296,72 +344,195 @@ class ExperimentAnalyzer:
     
     def evaluate_predictions(self, predicted_df: pd.DataFrame, actual_df: pd.DataFrame) -> Dict[str, Any]:
         """
-        Evaluates prediction accuracy for each characteristic
+        Evaluates prediction accuracy for each characteristic with multiple metrics
         """
         results = {}
         
-        # Calculate accuracy for each column
+        # Calculate metrics for each column
         for column in actual_df.columns:
-            if column in predicted_df.columns:
+            if column not in predicted_df.columns:
+                print(f"Warning: Column {column} not found in predictions")
+                continue
+            
+            # Log unique values for debugging
+            actual_unique = set(actual_df[column].unique())
+            predicted_unique = set(predicted_df[column].unique())
+            print(f"\nAnalyzing {column}:")
+            print(f"Actual unique values: {actual_unique}")
+            print(f"Predicted unique values: {predicted_unique}")
+            print(f"Mismatched values: {predicted_unique - actual_unique}")
+            
+            # Basic accuracy
+            accuracy = accuracy_score(actual_df[column], predicted_df[column])
+            
+            # Get classification report
+            try:
+                report = classification_report(
+                    actual_df[column], 
+                    predicted_df[column],
+                    output_dict=True,
+                    zero_division=0
+                )
+                
+                # Generate confusion matrix
+                conf_matrix = confusion_matrix(actual_df[column], predicted_df[column])
+                
                 results[column] = {
-                    'accuracy': accuracy_score(actual_df[column], predicted_df[column])
+                    'accuracy': accuracy,
+                    'classification_report': report,
+                    'confusion_matrix': conf_matrix,
+                    'unique_values': len(np.unique(actual_df[column]))
                 }
-        
+            except Exception as e:
+                print(f"Error calculating metrics for {column}: {str(e)}")
+                print(f"Sample actual values: {actual_df[column].head()}")
+                print(f"Sample predicted values: {predicted_df[column].head()}")
+            
         return results
+    
+    def _save_evaluation_results(self, results: Dict[str, Any]) -> None:
+        """Saves detailed evaluation results to a file"""
+        output = []
+        
+        # Overall summary
+        overall_accuracy = np.mean([v['accuracy'] for v in results.values()])
+        output.append(f"Overall Accuracy Across All Characteristics: {overall_accuracy:.2%}\n")
+        
+        # Detailed results for each characteristic
+        for characteristic, metrics in results.items():
+            output.append(f"\n{'='*50}")
+            output.append(f"\nCharacteristic: {characteristic}")
+            output.append(f"Number of unique values: {metrics['unique_values']}")
+            output.append(f"Accuracy: {metrics['accuracy']:.2%}")
+            
+            # Add classification report details
+            report = metrics['classification_report']
+            output.append("\nDetailed Metrics:")
+            output.append(f"Weighted Avg Precision: {report['weighted avg']['precision']:.2f}")
+            output.append(f"Weighted Avg Recall: {report['weighted avg']['recall']:.2f}")
+            output.append(f"Weighted Avg F1-score: {report['weighted avg']['f1-score']:.2f}")
+            
+            # Add per-class metrics
+            output.append("\nPer-class Metrics:")
+            for class_name, class_metrics in report.items():
+                if class_name not in ['accuracy', 'macro avg', 'weighted avg']:
+                    output.append(f"\n{class_name}:")
+                    output.append(f"  Precision: {class_metrics['precision']:.2f}")
+                    output.append(f"  Recall: {class_metrics['recall']:.2f}")
+                    output.append(f"  F1-score: {class_metrics['f1-score']:.2f}")
+                    output.append(f"  Support: {class_metrics['support']}")
+        
+        # Save to file
+        with open('evaluation_results.txt', 'w') as f:
+            f.write('\n'.join(output))
     
     def generate_visualizations(self, analysis_results: Dict[str, Any]) -> None:
         """
-        Generates and saves visualization of prediction accuracy
+        Generates and saves visualizations of prediction metrics
         """
+        # Create output directory if it doesn't exist
+        os.makedirs('analysis_output', exist_ok=True)
+
+        # Accuracy by characteristic
+        plt.figure(figsize=(15, 8))  # Increased figure size
         accuracies = [v['accuracy'] for v in analysis_results.values()]
         categories = list(analysis_results.keys())
         
-        plt.figure(figsize=(12, 6))
         plt.bar(categories, accuracies)
-        plt.xticks(rotation=45, ha='right')
-        plt.ylabel('Accuracy')
-        plt.title('Prediction Accuracy by Characteristic')
+        plt.xticks(rotation=45, ha='right', fontsize=12)  # Increased font size
+        plt.yticks(fontsize=12)  # Increased font size
+        plt.ylabel('Accuracy', fontsize=14)  # Increased font size
+        plt.title('Prediction Accuracy by Characteristic', fontsize=16, pad=20)  # Increased font size and padding
         plt.tight_layout()
-        plt.savefig('accuracy_by_characteristic.png')
+        plt.savefig('analysis_output/accuracy_by_characteristic.png', dpi=300, bbox_inches='tight')
         plt.close()
+        
+        # Confusion matrices for each characteristic
+        for char, metrics in analysis_results.items():
+            conf_matrix = metrics['confusion_matrix']
+            
+            # Get unique labels from the classification report
+            labels = list(metrics['classification_report'].keys())
+            labels = [l for l in labels if l not in ['accuracy', 'macro avg', 'weighted avg']]
+            
+            # Calculate figure size based on number of labels
+            n_labels = len(labels)
+            fig_size = max(12, n_labels * 1.5)  # Dynamic figure sizing
+            plt.figure(figsize=(fig_size, fig_size))
+            
+            # Create heatmap with improved styling
+            sns.heatmap(
+                conf_matrix,
+                annot=True,
+                fmt='d',
+                cmap='Blues',
+                xticklabels=labels,
+                yticklabels=labels,
+                square=True,
+                cbar_kws={'label': 'Count'},
+                annot_kws={'size': 12}  # Increased annotation font size
+            )
+            
+            # Improve labels and title
+            plt.title(f'Confusion Matrix - {char.replace("_", " ").title()}', 
+                     pad=20, size=16, fontweight='bold')
+            plt.xlabel('Predicted Label', labelpad=15, fontsize=14)
+            plt.ylabel('True Label', labelpad=15, fontsize=14)
+            
+            # Rotate labels for better readability and increase font size
+            plt.xticks(rotation=45, ha='right', fontsize=12)
+            plt.yticks(rotation=0, fontsize=12)
+            
+            # Add text annotation for accuracy
+            accuracy = metrics['accuracy']
+            plt.text(
+                0.5, -0.1,
+                f'Overall Accuracy: {accuracy:.2%}',
+                horizontalalignment='center',
+                transform=plt.gca().transAxes,
+                size=14,
+                fontweight='bold'
+            )
+            
+            # Adjust layout to prevent label cutoff
+            plt.tight_layout()
+            plt.savefig(f'analysis_output/confusion_matrix_{char}.png', 
+                       dpi=300, 
+                       bbox_inches='tight',
+                       pad_inches=0.5)  # Added padding
+            plt.close()
 
-async def run_experiment(num_personas: int = 100, messages_per_conversation: int = 5):
+async def run_experiment(num_personas: int = 100, messages_per_conversation: int = 5, max_concurrent: int = 5):
     """
-    Runs the complete experiment
-    
-    Parameters:
-    num_personas: Number of personas to generate and test
-    messages_per_conversation: Number of message exchanges before final questions
+    Runs the complete experiment with concurrent conversations
     """
     generator = PersonaGenerator()
     openai_manager = OpenAIManager()
-    conversation_manager = ConversationManager(openai_manager)
+    conversation_manager = ConversationManager(openai_manager, max_concurrent=max_concurrent)
+    
+    # Create tasks for all conversations
+    tasks = []
+    for i in range(num_personas):
+        actual_persona = generator.generate_persona()
+        task = asyncio.create_task(conversation_manager.conduct_conversation(
+            persona_id=i,
+            actual_persona=actual_persona,
+            num_messages=messages_per_conversation
+        ))
+        tasks.append((i, actual_persona, task))
     
     results = []
-    
-    for i in range(num_personas):
+    # Wait for all conversations to complete
+    for i, actual_persona, task in tasks:
         try:
-            # Generate persona
-            actual_persona = generator.generate_persona()
-            
-            # Conduct conversation
-            conversation_data = await conversation_manager.conduct_conversation(
-                persona_id=i,
-                actual_persona=actual_persona,
-                num_messages=messages_per_conversation
-            )
-            
-            # Parse prediction
+            conversation_data = await task
             predicted_persona = PredictionParser.parse_prediction(conversation_data['prediction'])
-            
             results.append({
                 'persona_id': i,
                 'actual_persona': actual_persona,
                 'predicted_persona': predicted_persona
             })
-            
             print(f"Completed conversation {i+1}/{num_personas}")
-            
         except Exception as e:
             print(f"Error in conversation {i}: {str(e)}")
             continue
@@ -380,13 +551,16 @@ async def run_experiment(num_personas: int = 100, messages_per_conversation: int
 
 if __name__ == "__main__":
     async def main():
+        # Create output directory for analysis results
+        os.makedirs('analysis_output', exist_ok=True)
+
         results, analysis = await run_experiment(
-            num_personas=50,
-            messages_per_conversation=6
+            num_personas=100,
+            messages_per_conversation=10,
+            max_concurrent=10  # Adjust based on your API limits and needs
         )
         return results, analysis
 
-    # Get the current event loop or create a new one
     loop = asyncio.get_event_loop()
     results, analysis = loop.run_until_complete(main())
     

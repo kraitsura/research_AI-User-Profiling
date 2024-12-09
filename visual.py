@@ -20,6 +20,7 @@ from plotly.subplots import make_subplots
 import networkx as nx
 from scipy import stats
 import dotenv
+from threading import Semaphore
 
 dotenv.load_dotenv()
 
@@ -176,10 +177,11 @@ class OpenAIManager:
 class ConversationManager:
     """Manages the flow of conversations between personas"""
     
-    def __init__(self, openai_manager: OpenAIManager, output_dir: str = "conversations"):
+    def __init__(self, openai_manager: OpenAIManager, output_dir: str = "conversations", max_concurrent: int = 5):
         self.openai_manager = openai_manager
         self.output_dir = output_dir
         self.conversation_metadata = {}
+        self.semaphore = Semaphore(max_concurrent)  # Add semaphore for concurrency control
         os.makedirs(output_dir, exist_ok=True)
 
     async def conduct_conversation(
@@ -189,75 +191,74 @@ class ConversationManager:
         num_messages: int
     ) -> Dict[str, Any]:
         """
-        Conducts a complete conversation session between two AIs:
-        1. Persona AI: Given the persona characteristics
-        2. Interviewer AI: Tries to naturally converse and later guess the persona
+        Conducts a complete conversation session between two AIs
         """
-        # Initialize persona AI with system prompt
-        persona_messages = [{
-            "role": "system",
-            "content": PersonaGenerator().generate_persona_system_prompt(actual_persona)
-        }]
-        
-        # Initialize interviewer AI with system prompt
-        interviewer_messages = [{
-            "role": "system",
-            "content": """You are an AI conducting a natural conversation. Your goal is to:
-            1. Have a genuine, engaging conversation
-            2. Through natural dialogue, try to understand the person you're talking to
-            3. Pay attention to subtle cues about their demographics, lifestyle, and views
-            4. Keep responses conversational and appropriate in length (2-4 sentences)
+        async with self.semaphore:  # Add semaphore context manager
+            # Initialize persona AI with system prompt
+            persona_messages = [{
+                "role": "system",
+                "content": PersonaGenerator().generate_persona_system_prompt(actual_persona)
+            }]
             
-            Do not explicitly ask about demographic information - let it come up naturally."""
-        }]
-        
-        # Start with a conversation starter
-        starter = ConversationPrompts.get_conversation_starter()
-        conversation_history = []  # To store the full conversation
-        conversation_history.append({"role": "interviewer", "content": starter})
-        
-        # Add starter to both message histories
-        persona_messages.append({"role": "user", "content": starter})
-        
-        # Conduct main conversation
-        for _ in range(num_messages):
-            # Get response from persona
-            persona_response = await self.openai_manager.get_completion(persona_messages)
-            conversation_history.append({"role": "persona", "content": persona_response})
-            interviewer_messages.append({"role": "user", "content": persona_response})
+            # Initialize interviewer AI with system prompt
+            interviewer_messages = [{
+                "role": "system",
+                "content": """You are an AI conducting a natural conversation. Your goal is to:
+                1. Have a genuine, engaging conversation
+                2. Through natural dialogue, try to understand the person you're talking to
+                3. Pay attention to subtle cues about their demographics, lifestyle, and views
+                4. Keep responses conversational and appropriate in length (2-4 sentences)
+                
+                Do not explicitly ask about demographic information - let it come up naturally."""
+            }]
             
-            # Generate next question from interviewer
-            interviewer_response = await self.openai_manager.get_completion(interviewer_messages)
-            conversation_history.append({"role": "interviewer", "content": interviewer_response})
-            persona_messages.append({"role": "user", "content": interviewer_response})
-        
-        # Ask final questions
-        for question in ConversationPrompts.FINAL_QUESTIONS:
-            conversation_history.append({"role": "interviewer", "content": question})
-            persona_messages.append({"role": "user", "content": question})
-            persona_response = await self.openai_manager.get_completion(persona_messages)
-            conversation_history.append({"role": "persona", "content": persona_response})
-        
-        # Get persona prediction from interviewer
-        analysis_prompt = ConversationPrompts.ANALYSIS_PROMPT
-        prediction = await self.openai_manager.get_completion([
-            {"role": "system", "content": "You are analyzing the conversation to predict characteristics of the person you spoke with."},
-            *[{"role": "user" if msg["role"] == "persona" else "assistant", "content": msg["content"]} 
-              for msg in conversation_history if msg["role"] in ["persona", "interviewer"]],
-            {"role": "user", "content": analysis_prompt}
-        ], temperature=0.3)
-        
-        # Save conversation
-        conversation_data = {
-            'persona_id': persona_id,
-            'actual_persona': actual_persona,
-            'conversation_history': conversation_history,
-            'prediction': prediction,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        self._save_conversation(conversation_data)
-        return conversation_data
+            # Start with a conversation starter
+            starter = ConversationPrompts.get_conversation_starter()
+            conversation_history = []  # To store the full conversation
+            conversation_history.append({"role": "interviewer", "content": starter})
+            
+            # Add starter to both message histories
+            persona_messages.append({"role": "user", "content": starter})
+            
+            # Conduct main conversation
+            for _ in range(num_messages):
+                # Get response from persona
+                persona_response = await self.openai_manager.get_completion(persona_messages)
+                conversation_history.append({"role": "persona", "content": persona_response})
+                interviewer_messages.append({"role": "user", "content": persona_response})
+                
+                # Generate next question from interviewer
+                interviewer_response = await self.openai_manager.get_completion(interviewer_messages)
+                conversation_history.append({"role": "interviewer", "content": interviewer_response})
+                persona_messages.append({"role": "user", "content": interviewer_response})
+            
+            # Ask final questions
+            for question in ConversationPrompts.FINAL_QUESTIONS:
+                conversation_history.append({"role": "interviewer", "content": question})
+                persona_messages.append({"role": "user", "content": question})
+                persona_response = await self.openai_manager.get_completion(persona_messages)
+                conversation_history.append({"role": "persona", "content": persona_response})
+            
+            # Get persona prediction from interviewer
+            analysis_prompt = ConversationPrompts.ANALYSIS_PROMPT
+            prediction = await self.openai_manager.get_completion([
+                {"role": "system", "content": "You are analyzing the conversation to predict characteristics of the person you spoke with."},
+                *[{"role": "user" if msg["role"] == "persona" else "assistant", "content": msg["content"]} 
+                  for msg in conversation_history if msg["role"] in ["persona", "interviewer"]],
+                {"role": "user", "content": analysis_prompt}
+            ], temperature=0.3)
+            
+            # Save conversation
+            conversation_data = {
+                'persona_id': persona_id,
+                'actual_persona': actual_persona,
+                'conversation_history': conversation_history,
+                'prediction': prediction,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            self._save_conversation(conversation_data)
+            return conversation_data
 
     def _save_conversation(self, conversation_data: Dict[str, Any]) -> None:
         """Saves conversation data to a JSON file"""
@@ -536,38 +537,41 @@ class ExperimentAnalyzer:
         self.visualizer.create_violin_plots(actual_df, predicted_df, numerical_cols)
 
 # Update the run_experiment function to use the new visualization capabilities
-async def run_experiment(num_personas: int = 100, messages_per_conversation: int = 5):
+async def run_experiment(num_personas: int = 100, messages_per_conversation: int = 5, max_concurrent: int = 5):
     """
-    Runs the complete experiment with enhanced visualization
+    Runs the complete experiment with concurrent conversations
     """
     generator = PersonaGenerator()
     openai_manager = OpenAIManager()
-    conversation_manager = ConversationManager(openai_manager)
+    conversation_manager = ConversationManager(openai_manager, max_concurrent=max_concurrent)
+    
+    # Create tasks for all conversations
+    tasks = []
+    for i in range(num_personas):
+        actual_persona = generator.generate_persona()
+        task = asyncio.create_task(conversation_manager.conduct_conversation(
+            persona_id=i,
+            actual_persona=actual_persona,
+            num_messages=messages_per_conversation
+        ))
+        tasks.append((i, actual_persona, task))
     
     results = []
-    
-    for i in range(num_personas):
+    # Wait for all conversations to complete
+    for i, actual_persona, task in tasks:
         try:
-            actual_persona = generator.generate_persona()
-            conversation_data = await conversation_manager.conduct_conversation(
-                persona_id=i,
-                actual_persona=actual_persona,
-                num_messages=messages_per_conversation
-            )
+            conversation_data = await task
             predicted_persona = PredictionParser.parse_prediction(conversation_data['prediction'])
-            
             results.append({
                 'persona_id': i,
                 'actual_persona': actual_persona,
                 'predicted_persona': predicted_persona
             })
-            
             print(f"Completed conversation {i+1}/{num_personas}")
-            
         except Exception as e:
             print(f"Error in conversation {i}: {str(e)}")
             continue
-    
+
     # Create DataFrames for analysis
     actual_df = pd.DataFrame([r['actual_persona'] for r in results])
     predicted_df = pd.DataFrame([r['predicted_persona'] for r in results])
@@ -584,8 +588,9 @@ async def run_experiment(num_personas: int = 100, messages_per_conversation: int
 if __name__ == "__main__":
     async def main():
         results, analysis_results, actual_df, predicted_df = await run_experiment(
-            num_personas=10,
-            messages_per_conversation=6
+            num_personas=100,
+            messages_per_conversation=10,
+            max_concurrent=10  # Add max_concurrent parameter
         )
         return results, analysis_results, actual_df, predicted_df
 
