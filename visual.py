@@ -20,7 +20,6 @@ from plotly.subplots import make_subplots
 import networkx as nx
 from scipy import stats
 import dotenv
-from threading import Semaphore
 
 dotenv.load_dotenv()
 
@@ -149,7 +148,7 @@ class PersonaGenerator:
 class OpenAIManager:
     """Manages interactions with the OpenAI API"""
     
-    def __init__(self, model="gpt-3.5-turbo"):
+    def __init__(self, model="gpt-4o-mini"):
         self.model = model
         self.retry_delay = 1
         self.max_retries = 3
@@ -181,7 +180,7 @@ class ConversationManager:
         self.openai_manager = openai_manager
         self.output_dir = output_dir
         self.conversation_metadata = {}
-        self.semaphore = Semaphore(max_concurrent)  # Add semaphore for concurrency control
+        self.semaphore = asyncio.Semaphore(max_concurrent)
         os.makedirs(output_dir, exist_ok=True)
 
     async def conduct_conversation(
@@ -572,6 +571,11 @@ async def run_experiment(num_personas: int = 100, messages_per_conversation: int
             print(f"Error in conversation {i}: {str(e)}")
             continue
 
+    # Check if we have any results before proceeding
+    if not results:
+        print("No conversations completed successfully. Skipping analysis.")
+        return [], {}, pd.DataFrame(), pd.DataFrame()
+
     # Create DataFrames for analysis
     actual_df = pd.DataFrame([r['actual_persona'] for r in results])
     predicted_df = pd.DataFrame([r['predicted_persona'] for r in results])
@@ -588,9 +592,9 @@ async def run_experiment(num_personas: int = 100, messages_per_conversation: int
 if __name__ == "__main__":
     async def main():
         results, analysis_results, actual_df, predicted_df = await run_experiment(
-            num_personas=100,
-            messages_per_conversation=10,
-            max_concurrent=10  # Add max_concurrent parameter
+            num_personas=50,
+            messages_per_conversation=20,
+            max_concurrent=5  # Add max_concurrent parameter
         )
         return results, analysis_results, actual_df, predicted_df
 

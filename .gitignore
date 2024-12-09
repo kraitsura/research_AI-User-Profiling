@@ -3,4 +3,4 @@
 .DS_Store
 /conversations
 /analysis_output
-/data
+__pycache__
